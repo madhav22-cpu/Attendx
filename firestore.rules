@@ -1,0 +1,166 @@
+rules_version = '2';
+
+// AttendX Firestore security rules.
+//
+// Collections:
+//   users/{uid}                  — profile + role ("student" | "teacher")
+//   classes/{classId}            — a class/section a teacher owns
+//   classEnrollments/{id}        — join table, id = `${classId}_${studentId}`
+//   attendanceSessions/{id}      — a QR attendance window for a class
+//   attendance/{id}              — one attendance record, id = `${sessionId}_${studentId}`
+//
+// Design principle: every write a student or teacher can make from the
+// client is re-validated here. The client never gets to assert its own
+// role, ownership, enrollment, or session validity — Firestore checks it.
+
+function isSignedIn() {
+  return request.auth != null;
+}
+
+function isSelf(uid) {
+  return isSignedIn() && request.auth.uid == uid;
+}
+
+function userDoc(uid) {
+  return get(/databases/$(database)/documents/users/$(uid)).data;
+}
+
+function role(uid) {
+  return userDoc(uid).role;
+}
+
+function isTeacher() {
+  return isSignedIn() && role(request.auth.uid) == "teacher";
+}
+
+function isStudent() {
+  return isSignedIn() && role(request.auth.uid) == "student";
+}
+
+function isEnrolled(classId, uid) {
+  return exists(/databases/$(database)/documents/classEnrollments/$(classId + "_" + uid));
+}
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------
+    // users/{uid}
+    // ---------------------------------------------------------------
+    match /users/{uid} {
+      // Any signed-in user can read a profile (needed to show teacher/
+      // student names on classes, rosters, attendance lists).
+      allow read: if isSignedIn();
+
+      // A user may create ONLY their own profile, and can never grant
+      // themselves the "teacher" role from the client — public sign-up
+      // can only ever produce a student profile.
+      allow create: if isSelf(uid)
+        && request.resource.data.role == "student"
+        && request.resource.data.uid == uid;
+
+      // A user may update their own profile, but never change their own
+      // role (prevents privilege escalation after the doc exists).
+      allow update: if isSelf(uid)
+        && request.resource.data.role == resource.data.role;
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // classes/{classId}
+    // ---------------------------------------------------------------
+    match /classes/{classId} {
+      // Any signed-in user can read class metadata (students need this to
+      // browse/verify classes they join or attend).
+      allow read: if isSignedIn();
+
+      // Only a teacher can create a class, and only as its own teacherId.
+      allow create: if isTeacher() && request.resource.data.teacherId == request.auth.uid;
+
+      // Only the owning teacher can update/delete their class.
+      allow update, delete: if isTeacher() && resource.data.teacherId == request.auth.uid;
+    }
+
+    // ---------------------------------------------------------------
+    // classEnrollments/{classId_studentId}
+    // ---------------------------------------------------------------
+    match /classEnrollments/{enrollmentId} {
+      allow read: if isSignedIn();
+
+      // A student can enroll only themselves, with a deterministic id
+      // that matches classId_studentId (prevents spoofing another
+      // student's enrollment or double-joining under a different id).
+      allow create: if isStudent()
+        && request.resource.data.studentId == request.auth.uid
+        && enrollmentId == request.resource.data.classId + "_" + request.auth.uid;
+
+      allow update: if false;
+
+      // A student may remove their own enrollment; the owning teacher may
+      // remove a student from their class.
+      allow delete: if isSignedIn()
+        && (resource.data.studentId == request.auth.uid
+          || (isTeacher()
+            && get(/databases/$(database)/documents/classes/$(resource.data.classId)).data.teacherId
+              == request.auth.uid));
+    }
+
+    // ---------------------------------------------------------------
+    // attendanceSessions/{sessionId}
+    // ---------------------------------------------------------------
+    match /attendanceSessions/{sessionId} {
+      // Signed-in users can read session metadata (students need to look
+      // up a scanned session's active/expiry state).
+      allow read: if isSignedIn();
+
+      // Only a teacher can start a session, and only for a class they own.
+      allow create: if isTeacher()
+        && request.resource.data.teacherId == request.auth.uid
+        && get(/databases/$(database)/documents/classes/$(request.resource.data.classId)).data.teacherId
+          == request.auth.uid;
+
+      // Only the owning teacher can update a session (e.g. end it early).
+      // The token, class and teacher can never be changed after creation.
+      allow update: if isTeacher()
+        && resource.data.teacherId == request.auth.uid
+        && request.resource.data.token == resource.data.token
+        && request.resource.data.classId == resource.data.classId
+        && request.resource.data.teacherId == resource.data.teacherId;
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------
+    // attendance/{sessionId_studentId}
+    // ---------------------------------------------------------------
+    match /attendance/{attendanceId} {
+      // A student can read their own records; a teacher can read records
+      // for sessions/classes they own (client queries already filter by
+      // teacherId, and this rule backstops that).
+      allow read: if isSignedIn()
+        && (resource.data.studentId == request.auth.uid
+          || (isTeacher() && resource.data.teacherId == request.auth.uid));
+
+      // A student may create an attendance record only for themself, only
+      // with the deterministic id `${sessionId}_${studentId}` (blocks
+      // duplicates — a second create at the same id is rejected because
+      // the document already exists), and only when:
+      //  - they are enrolled in the class the session belongs to
+      //  - the referenced session is active and not expired
+      //  - the session/class/teacher on the record match the real session
+      allow create: if isStudent()
+        && request.resource.data.studentId == request.auth.uid
+        && attendanceId == request.resource.data.sessionId + "_" + request.auth.uid
+        && isEnrolled(request.resource.data.classId, request.auth.uid)
+        && get(/databases/$(database)/documents/attendanceSessions/$(request.resource.data.sessionId)).data.active == true
+        && get(/databases/$(database)/documents/attendanceSessions/$(request.resource.data.sessionId)).data.expiresAt > request.time.toMillis()
+        && get(/databases/$(database)/documents/attendanceSessions/$(request.resource.data.sessionId)).data.classId == request.resource.data.classId
+        && get(/databases/$(database)/documents/attendanceSessions/$(request.resource.data.sessionId)).data.teacherId == request.resource.data.teacherId;
+
+      // Attendance records are immutable once written — no edits, by
+      // either the student or the teacher — and can never be deleted.
+      allow update, delete: if false;
+    }
+  }
+}
