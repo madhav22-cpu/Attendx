@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { QrCode, X } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
-import { useStartSession, useEndSession } from "@/hooks/useTeacherDashboard";
+import { useStartSession, useEndSession, useRefreshSessionToken } from "@/hooks/useTeacherDashboard";
 import { encodeQrPayload } from "@/lib/firestore";
 import type { AttendanceSessionDoc, ClassDoc } from "@/lib/types";
 
@@ -29,6 +29,7 @@ export function QrSessionModal({ open, classes, initialClassId, onClose }: Props
 
   const startSession = useStartSession();
   const endSession = useEndSession();
+  const refreshSessionToken = useRefreshSessionToken();
 
   useEffect(() => {
     if (open) {
@@ -39,6 +40,27 @@ export function QrSessionModal({ open, classes, initialClassId, onClose }: Props
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, initialClassId]);
+
+  // Rotate the QR token every five seconds while the session is active.
+  // The stored token is updated first, so the scanner only accepts the latest QR.
+  useEffect(() => {
+    if (!session || !session.active || remaining === 0) return;
+    let cancelled = false;
+    const rotate = async () => {
+      try {
+        const token = await refreshSessionToken.mutateAsync(session.id);
+        if (!cancelled) setSession((current) => current && current.id === session.id ? { ...current, token } : current);
+      } catch (err) {
+        console.error("Failed to refresh attendance QR:", err);
+        // Keep the currently valid QR visible if a refresh request fails.
+      }
+    };
+    const timer = window.setInterval(() => { void rotate(); }, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [session?.id, session?.active, remaining === 0]);
 
   useEffect(() => {
     if (!session) return;
@@ -210,7 +232,7 @@ export function QrSessionModal({ open, classes, initialClassId, onClose }: Props
             </div>
 
             <p className="mt-7 text-sm text-muted-foreground">
-              Students can scan this code to mark attendance.
+              QR refreshes every 5 seconds. Scan the latest code to mark attendance.
             </p>
             <p className="mt-4 font-display text-3xl font-semibold tracking-[-0.03em] text-foreground">
               {fmt(remaining)}{" "}

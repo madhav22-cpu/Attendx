@@ -120,11 +120,10 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/classes/$(request.resource.data.classId)).data.teacherId
           == request.auth.uid;
 
-      // Only the owning teacher can update a session (e.g. end it early).
-      // The token, class and teacher can never be changed after creation.
+      // Only the owning teacher can update a session (e.g. end it early
+      // or rotate the QR token). The class and teacher cannot be changed.
       allow update: if isTeacher()
         && resource.data.teacherId == request.auth.uid
-        && request.resource.data.token == resource.data.token
         && request.resource.data.classId == resource.data.classId
         && request.resource.data.teacherId == resource.data.teacherId;
 

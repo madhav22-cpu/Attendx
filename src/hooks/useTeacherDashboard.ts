@@ -8,6 +8,7 @@ import {
   listTeacherClasses,
   listTeacherSessions,
   startAttendanceSession,
+  refreshAttendanceSessionToken,
 } from "@/lib/firestore";
 import type { ClassDoc } from "@/lib/types";
 
@@ -141,6 +142,12 @@ export function useStartSession() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["teacher-sessions", user?.uid] });
     },
+  });
+}
+
+export function useRefreshSessionToken() {
+  return useMutation({
+    mutationFn: (sessionId: string) => refreshAttendanceSessionToken(sessionId),
   });
 }
 
